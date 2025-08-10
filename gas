@@ -11,12 +11,25 @@ const RETRY_DELAY     = 30000;             // 30 s before single retry
 const MAX_RUNTIME_MS  = 25 * 60 * 1000;    // stop at 25 min
 const LOG_SHEET       = 'LOG_Create MASTER_PROMPTS';
 
-// ★ Cloud Run service configuration (from SETUP sheet if present)
-const SERVICE_CONFIG_KEYS = ['service_base_url','service_token'];
+// ★ Cloud Run service configuration (per-function URLs from SETUP)
+const SERVICE_CONFIG_KEYS = [
+  'svc_master_prompts',
+  'svc_chat_complete',
+  'svc_images_generate',
+  'svc_images_generate_with_context',
+  'svc_vision_guidelines',
+  'service_token'
+];
 function getServiceConfig_(){
   const cfg = getNamedSetupValues_(SERVICE_CONFIG_KEYS);
   return {
-    baseUrl: String(cfg.service_base_url || '').trim(),
+    urls: {
+      masterPrompts: String(cfg.svc_master_prompts || '').trim(),
+      chatComplete: String(cfg.svc_chat_complete || '').trim(),
+      imgGen: String(cfg.svc_images_generate || '').trim(),
+      imgGenCtx: String(cfg.svc_images_generate_with_context || '').trim(),
+      visionGuidelines: String(cfg.svc_vision_guidelines || '').trim()
+    },
     token  : String(cfg.service_token || '').trim()
   };
 }
@@ -28,10 +41,9 @@ function serviceHeaders_(){
   return h;
 }
 
-function callServiceJson_(path, payload){
-  const { baseUrl } = getServiceConfig_();
-  if (!baseUrl) throw new Error('SETUP missing service_base_url');
-  const resp = UrlFetchApp.fetch(baseUrl + path, {
+function callServiceJsonUrl_(fullUrl, payload){
+  if (!fullUrl) throw new Error('Missing service URL');
+  const resp = UrlFetchApp.fetch(fullUrl, {
     method : 'post',
     headers: serviceHeaders_(),
     payload: JSON.stringify(payload),
@@ -43,11 +55,10 @@ function callServiceJson_(path, payload){
   return JSON.parse(text);
 }
 
-function fetchAllServiceJson_(path, payloads){
-  const { baseUrl } = getServiceConfig_();
-  if (!baseUrl) throw new Error('SETUP missing service_base_url');
+function fetchAllServiceJsonUrl_(fullUrl, payloads){
+  if (!fullUrl) throw new Error('Missing service URL');
   const requests = payloads.map(p=>({
-    url: baseUrl + path,
+    url: fullUrl,
     method: 'post',
     headers: serviceHeaders_(),
     payload: JSON.stringify(p),
@@ -91,7 +102,7 @@ function Create_MASTER_PROMPTS() {
   const setup = getNamedSetupValues_([
     'assistant_id',
     'initial_images_prompt','product_images_prompt',
-    'language_images','service_base_url'
+    'language_images'
   ]);
   const assistantId   = setup.assistant_id;
   const initialPrompt = setup.initial_images_prompt;
@@ -101,19 +112,17 @@ function Create_MASTER_PROMPTS() {
     safeAlert('SETUP sheet is missing required keys.');
     return;
   }
-  const { baseUrl } = getServiceConfig_();
-  if (!baseUrl) { safeAlert('SETUP missing service_base_url'); return; }
+  const { urls } = getServiceConfig_();
+  if (!urls.masterPrompts) { safeAlert('SETUP missing svc_master_prompts'); return; }
 
   const imgSheet = getOrBuildImgSheet_(ss);
 
-  // Prepare init message once
   const initMsg = expandInitialPrompt_(initialPrompt, ss, langCode);
 
   const lastRow    = imgSheet.getLastRow();
   const themeCount = imgSheet.getLastColumn() - 2;
   const failed     = [];
 
-  // Gather all rows needing work
   const rows = [];
   for (let r = 2; r <= lastRow; r++) {
     const asin = String(imgSheet.getRange(r, 1).getValue()).trim();
@@ -122,8 +131,7 @@ function Create_MASTER_PROMPTS() {
     if (!hasAny) rows.push({ r, asin });
   }
 
-  // Process in parallel batches
-  const BATCH = 8; // parallel size
+  const BATCH = 8;
   for (let i = 0; i < rows.length; i += BATCH) {
     const chunk = rows.slice(i, i + BATCH);
 
@@ -133,7 +141,7 @@ function Create_MASTER_PROMPTS() {
       return { assistantId, initMsg, userMsg: userPrompt };
     });
 
-    const results = fetchAllServiceJson_('/assistant/master-prompts', payloads);
+    const results = fetchAllServiceJsonUrl_(urls.masterPrompts, payloads);
 
     results.forEach((res, idx) => {
       const { r, asin } = chunk[idx];
@@ -507,7 +515,7 @@ function Get_to_REFINED_PROMPTS() {
     'graphical_guidelines',
     'prompts_examples',
     'number_of_new_tiles',
-    'language_images','service_base_url'
+    'language_images'
   ]);
   const tplPrompt      = setup.refine_prompts_prompt;
   const graphicalGuide = setup.graphical_guidelines || '';
@@ -515,8 +523,8 @@ function Get_to_REFINED_PROMPTS() {
   const numberTiles    = setup.number_of_new_tiles|| '';
   const langCode       = setup.language_images    || '';
   if (!tplPrompt) { safeAlert('SETUP sheet is missing refine_prompts_prompt.'); return; }
-  const { baseUrl } = getServiceConfig_();
-  if (!baseUrl) { safeAlert('SETUP missing service_base_url'); return; }
+  const { urls: urlsRP } = getServiceConfig_();
+  if (!urlsRP.chatComplete) { safeAlert('SETUP missing svc_chat_complete'); return; }
 
   /* 0a – SPECIFIC TILE n ******************************************************/
   const specTiles=[];
@@ -617,7 +625,7 @@ function Get_to_REFINED_PROMPTS() {
     const chunk = tasks.slice(i,i+BATCH);
     const payloads = chunk.map(t=>({ model:'o3', prompt: t.promptTxt }));
 
-    const results = fetchAllServiceJson_('/chat/complete', payloads);
+    const results = fetchAllServiceJsonUrl_(urlsRP.chatComplete, payloads);
     results.forEach((res, idx)=>{
       const t = chunk[idx];
       if (res.code !== 200) {
@@ -896,8 +904,10 @@ function lookupCleanUrl_(asin, colIdx, vals){
  *  NEW: detailed image call – returns {b64, raw}
  *──────────────────────────────────────────────────────────────*/
 function generateImage_(apiKey, systemTxt, userTxt, prodImgUrl) {
+  const { urls } = getServiceConfig_();
+  if (!urls.imgGen) return { b64:'', raw:'Missing svc_images_generate' };
   try {
-    const resp = callServiceJson_('/images/generate', {
+    const resp = callServiceJsonUrl_(urls.imgGen, {
       system: systemTxt,
       user: userTxt,
       prodImgUrl
@@ -1131,7 +1141,9 @@ function scheduleSelf_() {
  *      assistantMsg  – the *entire* assistant message object to keep in context
  */
 function runGuidelineCall_(apiKey, guidelinePrompt, packLink) {
-  const svc = callServiceJson_('/vision/guidelines', { guidelinePrompt, packLink, model:'gpt-4o-mini' });
+  const { urls } = getServiceConfig_();
+  if (!urls.visionGuidelines) throw new Error('Missing svc_vision_guidelines');
+  const svc = callServiceJsonUrl_(urls.visionGuidelines, { guidelinePrompt, packLink, model:'gpt-4o-mini' });
   return { text: svc.text, assistantMsg: svc.assistantMsg };
 }
 
@@ -1174,7 +1186,9 @@ function getOrCreateFileId_(apiKey, packLink, linksSh, row, PACK_FILE_COL) {
  * Returns { imageB64, toolCallObj }  (toolCallObj must be appended to context)
  */
 function runImageGenerationWithContext_(apiKey, inputArr, userPrompt, imgUrl) {
-  const svc = callServiceJson_('/images/generate-with-context', {
+  const { urls } = getServiceConfig_();
+  if (!urls.imgGenCtx) return { imageB64:'', toolCallObj:null, assistantText:'Missing svc_images_generate_with_context' };
+  const svc = callServiceJsonUrl_(urls.imgGenCtx, {
     inputArr, userPrompt, imgUrl, model: 'gpt-4.1-mini'
   });
   return { imageB64: svc.imageB64 || '', toolCallObj: svc.toolCallObj || null, assistantText: svc.assistantText || '' };
@@ -1208,10 +1222,10 @@ function Generate_COPY_FEED() {
   const t0 = Date.now();
 
   /*──── SETUP – keys ────*/
-  const setup = getNamedSetupValues_(['extract_copy_feed','service_base_url']);
+  const setup = getNamedSetupValues_(['extract_copy_feed']);
   const sysPrompt = setup.extract_copy_feed || '';
-  const { baseUrl } = getServiceConfig_();
-  if (!sysPrompt || !baseUrl) { safeAlert('SETUP missing extract_copy_feed or service_base_url'); return; }
+  const { urls: urlsCF } = getServiceConfig_();
+  if (!sysPrompt || !urlsCF.chatComplete) { safeAlert('SETUP missing extract_copy_feed or svc_chat_complete'); return; }
 
   /*──── source / target sheets ────*/
   const srcSh = getSheetByNameInsensitive_('REFINED_PROMPTS');
@@ -1249,7 +1263,7 @@ function Generate_COPY_FEED() {
   for (let i=0;i<tasks.length;i+=BATCH){
     const chunk = tasks.slice(i,i+BATCH);
     const payloads = chunk.map(t=>({ model:'gpt-4.1', prompt: t.prompt }));
-    const results = fetchAllServiceJson_('/chat/complete', payloads);
+    const results = fetchAllServiceJsonUrl_(urlsCF.chatComplete, payloads);
 
     results.forEach((res, idx)=>{
       const t = chunk[idx];
