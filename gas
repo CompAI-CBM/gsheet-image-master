@@ -11,6 +11,66 @@ const RETRY_DELAY     = 30000;             // 30 s before single retry
 const MAX_RUNTIME_MS  = 25 * 60 * 1000;    // stop at 25 min
 const LOG_SHEET       = 'LOG_Create MASTER_PROMPTS';
 
+// ★ Cloud Run service configuration (per-function URLs from SETUP)
+const SERVICE_CONFIG_KEYS = [
+  'svc_master_prompts',
+  'svc_chat_complete',
+  'svc_images_generate',
+  'svc_images_generate_with_context',
+  'svc_vision_guidelines',
+  'service_token'
+];
+function getServiceConfig_(){
+  const cfg = getNamedSetupValues_(SERVICE_CONFIG_KEYS);
+  return {
+    urls: {
+      masterPrompts: String(cfg.svc_master_prompts || '').trim(),
+      chatComplete: String(cfg.svc_chat_complete || '').trim(),
+      imgGen: String(cfg.svc_images_generate || '').trim(),
+      imgGenCtx: String(cfg.svc_images_generate_with_context || '').trim(),
+      visionGuidelines: String(cfg.svc_vision_guidelines || '').trim()
+    },
+    token  : String(cfg.service_token || '').trim()
+  };
+}
+
+function serviceHeaders_(){
+  const { token } = getServiceConfig_();
+  const h = { 'Content-Type':'application/json' };
+  if (token) h['x-service-token'] = token;
+  return h;
+}
+
+function callServiceJsonUrl_(fullUrl, payload){
+  if (!fullUrl) throw new Error('Missing service URL');
+  const resp = UrlFetchApp.fetch(fullUrl, {
+    method : 'post',
+    headers: serviceHeaders_(),
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code !== 200) throw new Error('HTTP '+code+' '+text);
+  return JSON.parse(text);
+}
+
+function fetchAllServiceJsonUrl_(fullUrl, payloads){
+  if (!fullUrl) throw new Error('Missing service URL');
+  const requests = payloads.map(p=>({
+    url: fullUrl,
+    method: 'post',
+    headers: serviceHeaders_(),
+    payload: JSON.stringify(p),
+    muteHttpExceptions: true,
+    contentType: 'application/json'
+  }));
+  return UrlFetchApp.fetchAll(requests).map(r=>({
+    code: r.getResponseCode(),
+    body: r.getContentText()
+  }));
+}
+
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Image Master Agent Manual Mode')
@@ -31,7 +91,6 @@ function Create_MASTER_PROMPTS() {
   const props = PropertiesService.getScriptProperties();
   const t0    = Date.now();
 
-  /* ── AUTO-RESET (set to false if you ever need to resume) ── */
   const ALWAYS_START_FRESH = true;
   if (ALWAYS_START_FRESH) {
     props.deleteProperty('THREAD_ID');
@@ -40,126 +99,87 @@ function Create_MASTER_PROMPTS() {
 
   ensureSheet_(LOG_SHEET);
 
-  /* 1 -- Credentials & static prompts */
   const setup = getNamedSetupValues_([
-    'OPENAI_API_KEY','assistant_id',
+    'assistant_id',
     'initial_images_prompt','product_images_prompt',
     'language_images'
   ]);
-  const apiKey        = setup.OPENAI_API_KEY;
   const assistantId   = setup.assistant_id;
   const initialPrompt = setup.initial_images_prompt;
   const perProdTpl    = setup.product_images_prompt;
   const langCode      = setup.language_images;
-  if (!apiKey || !assistantId || !initialPrompt || !perProdTpl) {
+  if (!assistantId || !initialPrompt || !perProdTpl) {
     safeAlert('SETUP sheet is missing required keys.');
     return;
   }
+  const { urls } = getServiceConfig_();
+  if (!urls.masterPrompts) { safeAlert('SETUP missing svc_master_prompts'); return; }
 
-  /* 2 -- IMG_PROMPTS sheet */
   const imgSheet = getOrBuildImgSheet_(ss);
 
-  /* 3 -- Row to resume from */
-  const rangeA = imgSheet.getRange('A2:A').getValues();
-  let startRow = 2;
-  for (let i = 0; i < rangeA.length; i++) {
-    const rowIdx = i + 2;
-    if (rangeA[i][0] && !imgSheet.getRange(rowIdx, 2).getValue()) {
-      startRow = rowIdx;
-      break;
-    }
-  }
-
-  /* 4 -- Assistant thread (batch-aware) */
-  let threadId   = null;          // current thread
-  let batchCount = 0;             // products handled in this thread
-
   const initMsg = expandInitialPrompt_(initialPrompt, ss, langCode);
-  {
-    // create first thread at start of run
-    const {threadId:tid, errorMsg} =
-          startNewThread_(apiKey, assistantId, initMsg);
-    if (!tid) { safeAlert('Initial assistant call failed – see log.'); return; }
-    threadId = tid;
-  }
 
-
-  /* 5 -- Loop through ASINs */
   const lastRow    = imgSheet.getLastRow();
-  const themeCount = imgSheet.getLastColumn() - 2;   // B…(last-1)
+  const themeCount = imgSheet.getLastColumn() - 2;
   const failed     = [];
 
-  for (let r = startRow; r <= lastRow; r++) {
-    const asin = imgSheet.getRange(r, 1).getValue();
+  const rows = [];
+  for (let r = 2; r <= lastRow; r++) {
+    const asin = String(imgSheet.getRange(r, 1).getValue()).trim();
     if (!asin) break;
+    const hasAny = String(imgSheet.getRange(r, 2).getValue()).trim();
+    if (!hasAny) rows.push({ r, asin });
+  }
 
-    /* 🆕 Reset context every BATCH_SIZE products */
-    if (batchCount >= BATCH_SIZE) {
-      const { threadId: tid, errorMsg } =
-            startNewThread_(apiKey, assistantId, initMsg);
-      if (!tid) {                        // fatal – stop the script
+  const BATCH = 8;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const chunk = rows.slice(i, i + BATCH);
+
+    const payloads = chunk.map(({ asin }) => {
+      const productInfo = buildProductBlock_(asin);
+      const userPrompt  = perProdTpl.replace(/\{\{product\}\}/gi, productInfo);
+      return { assistantId, initMsg, userMsg: userPrompt };
+    });
+
+    const results = fetchAllServiceJsonUrl_(urls.masterPrompts, payloads);
+
+    results.forEach((res, idx) => {
+      const { r, asin } = chunk[idx];
+      const expected    = themeCount + 1;
+      if (res.code !== 200) {
         failed.push(asin);
-        safeAlert('Batch re-initialisation failed – see log.');
-        break;
+        logCall_(asin, 'FAIL', payloads[idx].userMsg, 'HTTP '+res.code, res.body);
+        return;
       }
-      threadId   = tid;
-      batchCount = 0;
-    }
-
-
-    /* 5a – per-product prompt */
-    const productInfo = buildProductBlock_(asin);
-    const userPrompt  = perProdTpl.replace(/{{product}}/gi, productInfo);
-
-    /* 5b – assistant call with retry */
-    let answer = '';
-    try {
-      answer = runAssistant_(apiKey, assistantId, threadId, userPrompt);
-    } catch (e) {
-      Utilities.sleep(RETRY_DELAY);
+      let text = '';
       try {
-        answer = runAssistant_(apiKey, assistantId, threadId, userPrompt);
-      } catch (err) {
+        const j = JSON.parse(res.body);
+        text = j.text || '';
+      } catch (e) {
         failed.push(asin);
-        logCall_(asin, 'FAIL', userPrompt, String(err), '');
-        continue;
+        logCall_(asin, 'FAIL', payloads[idx].userMsg, 'JSON parse error', res.body);
+        return;
       }
-    }
 
-    /* 5c – parse & write */
-    const expected = themeCount + 1;                 // themes + extra-tile
-    let prompts = parseMarkdownRow_(answer, expected);
-
-    // If we got some cells but not the full count, pad with blanks
-    if (prompts.length && prompts.length < expected) {
+      const prompts = parseMarkdownRow_(text, expected);
+      if (prompts.length === 0) {
+        failed.push(asin);
+        logCall_(asin, 'FAIL', payloads[idx].userMsg, 'Parse error – no usable cells', text);
+        return;
+      }
       while (prompts.length < expected) prompts.push('');
-    }
+      imgSheet.getRange(r, 2, 1, expected).setValues([prompts.slice(0, expected)]);
+      logCall_(asin, 'OK', payloads[idx].userMsg, '', text);
+    });
 
-    // If nothing at all came back, mark this ASIN as failed
-    if (prompts.length === 0) {
-      failed.push(asin);
-      logCall_(asin, 'FAIL', userPrompt, 'Parse error – no usable cells', answer);
-      continue;
-    }
-
-    imgSheet.getRange(r, 2, 1, expected)
-            .setValues([prompts.slice(0, expected)]);
-    logCall_(asin, 'OK', userPrompt, '', answer);
-    batchCount++;   // 🆕 count this ASIN inside the current batch
-
-    Utilities.sleep(RATE_DELAY);
-
-    /* 5d – runtime guard */
     if (Date.now() - t0 > MAX_RUNTIME_MS) {
-      ScriptApp.newTrigger('Create_MASTER_PROMPTS')
-               .timeBased().after(10000).create();
+      ScriptApp.newTrigger('Create_MASTER_PROMPTS').timeBased().after(10000).create();
       safeAlert('Time limit reached – script will resume in 10 seconds.');
       return;
     }
   }
 
-  safeAlert('Create MASTER_PROMPTS finished.\nFailed ASINs: ' +
-          (failed.length ? failed.join(', ') : 'none'));
+  safeAlert('Create MASTER_PROMPTS finished. Failed ASINs: ' + (failed.length ? failed.join(', ') : 'none'));
 }
 
 /*────────────── HELPERS ─────────────*/
@@ -491,23 +511,20 @@ function Get_to_REFINED_PROMPTS() {
 
   /* 0️⃣  SETUP ****************************************************************/
   const setup = getNamedSetupValues_([
-    'OPENAI_API_KEY',
     'refine_prompts_prompt',
     'graphical_guidelines',
     'prompts_examples',
     'number_of_new_tiles',
     'language_images'
   ]);
-  const apiKey         = setup.OPENAI_API_KEY;
   const tplPrompt      = setup.refine_prompts_prompt;
   const graphicalGuide = setup.graphical_guidelines || '';
   const colNumsRaw     = setup.prompts_examples   || '';
   const numberTiles    = setup.number_of_new_tiles|| '';
   const langCode       = setup.language_images    || '';
-  if (!apiKey || !tplPrompt) {
-    safeAlert('SETUP sheet is missing OPENAI_API_KEY or refine_prompts_prompt.');
-    return;
-  }
+  if (!tplPrompt) { safeAlert('SETUP sheet is missing refine_prompts_prompt.'); return; }
+  const { urls: urlsRP } = getServiceConfig_();
+  if (!urlsRP.chatComplete) { safeAlert('SETUP missing svc_chat_complete'); return; }
 
   /* 0a – SPECIFIC TILE n ******************************************************/
   const specTiles=[];
@@ -558,19 +575,21 @@ function Get_to_REFINED_PROMPTS() {
       .appendRow([new Date(),asin,status,req,info,res]);
   }
 
-  /* 5️⃣  Main loop ************************************************************/
+  /* 5️⃣  Build tasks then run in parallel *************************************/
   const lastRow=imgSh.getLastRow();
   const expectedBaseCols=imgSh.getLastColumn()-1;
   const expectedCount   =expectedBaseCols+specTiles.length;
 
+  const specBlock=specTiles.map(t=>`SPECIFIC TILE ${t.n}\n${t.text}`).join('\n');
+
+  const tasks = [];
   for(let r=2;r<=lastRow;r++){
-    const asin=imgSh.getRange(r,1).getValue();
+    const asin=String(imgSh.getRange(r,1).getValue()).trim();
     if(!asin)break;
 
-    /* product_information (skip REVCOUNT columns) */
     let productInfo=asin;
     if(cleanVals.length){
-      const row=cleanVals.find(v=>v[0]===asin);
+      const row=cleanVals.find(v=>String(v[0]).trim()===asin);
       if(row){
         productInfo=row.map((cell,idx)=>({cell:String(cell).trim(),idx}))
                         .filter(o=>o.idx!==0 && !revIdxSet.has(o.idx))
@@ -580,15 +599,10 @@ function Get_to_REFINED_PROMPTS() {
       }
     }
 
-    /* draft_prompts markdown */
     const draftVals=imgSh.getRange(r,2,1,expectedBaseCols).getValues()[0]
                         .map(c=>String(c).trim());
     const draftRow='| '+draftVals.join(' | ')+' |';
 
-    /* spec_tiles block */
-    const specBlock=specTiles.map(t=>`SPECIFIC TILE ${t.n}\n${t.text}`).join('\n');
-
-    /* build user prompt */
     const vars={
       product_information:productInfo,
       draft_prompts:draftRow,
@@ -603,45 +617,42 @@ function Get_to_REFINED_PROMPTS() {
       promptTxt=promptTxt.replace(new RegExp('\\{'+k+'\\}','gi'),v||'');
     });
 
-    /* call OpenAI ***********************************************************/
-    const payload={model:'o3',messages:[{role:'user',content:promptTxt}]};
-    const headers={Authorization:'Bearer '+apiKey,'Content-Type':'application/json'};
-    const response=UrlFetchApp.fetch(
-      'https://api.openai.com/v1/chat/completions',{
-        method:'post',headers,payload:JSON.stringify(payload),muteHttpExceptions:true
-      });
-    const code=response.getResponseCode();
-    const body=response.getContentText();
+    tasks.push({ r, asin, promptTxt });
+  }
 
-    if(code!==200){
-      logRefined_(asin,'FAIL',promptTxt,'HTTP '+code,body);
-      continue;
-    }
+  const BATCH = 12;
+  for (let i=0;i<tasks.length;i+=BATCH){
+    const chunk = tasks.slice(i,i+BATCH);
+    const payloads = chunk.map(t=>({ model:'o3', prompt: t.promptTxt }));
 
-    let answer='';
-    try{
-      const json=JSON.parse(body);
-      answer=json.choices?.[0]?.message?.content||'';
-    }catch(e){
-      logRefined_(asin,'FAIL',promptTxt,'JSON parse error',body);
-      continue;
-    }
+    const results = fetchAllServiceJsonUrl_(urlsRP.chatComplete, payloads);
+    results.forEach((res, idx)=>{
+      const t = chunk[idx];
+      if (res.code !== 200) {
+        logRefined_(t.asin,'FAIL',t.promptTxt,'HTTP '+res.code,res.body);
+        return;
+      }
+      let text='';
+      try{
+        const j = JSON.parse(res.body);
+        text = j.text || '';
+      }catch(e){
+        logRefined_(t.asin,'FAIL',t.promptTxt,'JSON parse error',res.body);
+        return;
+      }
 
-    const cells=parseMarkdownRow_(answer,expectedCount);
-    if(cells.length===0){
-      logRefined_(asin,'FAIL',promptTxt,'Parse error – no usable cells',answer);
-      continue;
-    }
-
-    refSh.getRange(r,1,1,1+expectedCount)
-         .setValues([[asin].concat(cells.slice(0,expectedCount))]);
-    logRefined_(asin,'OK',promptTxt,'',answer);
-
-    Utilities.sleep(RATE_DELAY);
+      const cells=parseMarkdownRow_(text,expectedCount);
+      if(cells.length===0){
+        logRefined_(t.asin,'FAIL',t.promptTxt,'Parse error – no usable cells',text);
+        return;
+      }
+      refSh.getRange(t.r,1,1,1+expectedCount)
+           .setValues([[t.asin].concat(cells.slice(0,expectedCount))]);
+      logRefined_(t.asin,'OK',t.promptTxt,'',text);
+    });
   }
 
   safeAlert('Get REFINED_PROMPTS finished.');
-
 }
 
 
@@ -893,37 +904,18 @@ function lookupCleanUrl_(asin, colIdx, vals){
  *  NEW: detailed image call – returns {b64, raw}
  *──────────────────────────────────────────────────────────────*/
 function generateImage_(apiKey, systemTxt, userTxt, prodImgUrl) {
-  const inputArr = [];
-  if (systemTxt) inputArr.push({ role:'system', content: systemTxt });
-
-  const userContent = [{ type:'input_text', text: userTxt }];
-  if (prodImgUrl) userContent.push({ type:'input_image', image_url: prodImgUrl });
-  inputArr.push({ role:'user', content: userContent });
-
-  const payload = { model:'gpt-4o', input:inputArr, tools:[{type:'image_generation'}] };
-  let lastRaw = '';
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const resp   = UrlFetchApp.fetch('https://api.openai.com/v1/responses', {
-                     method:'post',
-                     headers:{ Authorization:'Bearer '+apiKey,
-                               'Content-Type':'application/json' },
-                     payload:JSON.stringify(payload),
-                     muteHttpExceptions:true
-                   });
-    lastRaw      = resp.getContentText();
-
-    if (resp.getResponseCode() !== 200) { Utilities.sleep(IMG_RETRY_DELAY); continue; }
-
-    try {
-      const json = JSON.parse(lastRaw);
-      const tc   = (json.output || []).find(o => o.type === 'image_generation_call');
-      if (tc && tc.result) return { b64: tc.result, raw: lastRaw };
-    } catch (_) { /* fall through and retry once */ }
-
-    Utilities.sleep(IMG_RETRY_DELAY);
+  const { urls } = getServiceConfig_();
+  if (!urls.imgGen) return { b64:'', raw:'Missing svc_images_generate' };
+  try {
+    const resp = callServiceJsonUrl_(urls.imgGen, {
+      system: systemTxt,
+      user: userTxt,
+      prodImgUrl
+    });
+    return { b64: resp.b64 || '', raw: JSON.stringify(resp.raw || resp) };
+  } catch (e) {
+    return { b64: '', raw: String(e) };
   }
-  return { b64:'', raw:lastRaw };      // even on hard fail, give back raw text
 }
 
 /*──────────────────────────────────────────────────────────────*/
@@ -1149,34 +1141,10 @@ function scheduleSelf_() {
  *      assistantMsg  – the *entire* assistant message object to keep in context
  */
 function runGuidelineCall_(apiKey, guidelinePrompt, packLink) {
-  const payload = {
-    model : 'gpt-4o-mini',
-    input : [{
-      role    : 'user',
-      content : [
-        { type:'input_text',  text: guidelinePrompt },
-        { type:'input_image', image_url: packLink }
-      ]
-    }]
-  };
-
-  const resp = JSON.parse(UrlFetchApp.fetch(
-    'https://api.openai.com/v1/responses',
-    {
-      method : 'post',
-      headers: { Authorization:'Bearer '+apiKey,
-                 'Content-Type':'application/json' },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions:true
-    }
-  ).getContentText());
-
-  const msg = (resp.output && resp.output[0]) || null;
-  const txt = msg && (msg.text ||
-             (msg.content&&msg.content.length&&msg.content[0].text)) || '';
-  if (!txt) throw new Error('Empty guideline reply.\n'+JSON.stringify(resp));
-
-  return { text: txt.trim(), assistantMsg: msg };
+  const { urls } = getServiceConfig_();
+  if (!urls.visionGuidelines) throw new Error('Missing svc_vision_guidelines');
+  const svc = callServiceJsonUrl_(urls.visionGuidelines, { guidelinePrompt, packLink, model:'gpt-4o-mini' });
+  return { text: svc.text, assistantMsg: svc.assistantMsg };
 }
 
 /*───────────────────────────────  Upload pack-shot once  ────────────────────────────────
@@ -1218,47 +1186,12 @@ function getOrCreateFileId_(apiKey, packLink, linksSh, row, PACK_FILE_COL) {
  * Returns { imageB64, toolCallObj }  (toolCallObj must be appended to context)
  */
 function runImageGenerationWithContext_(apiKey, inputArr, userPrompt, imgUrl) {
-
-  /* ---------- build user message ---------- */
-  const userContent = [{ type: 'input_text', text: userPrompt }];
-  if (imgUrl) {                                        // attach as URL
-    userContent.push({ type: 'input_image', image_url: imgUrl });
-  }
-  const userMsg = { role: 'user', content: userContent };
-
-  const payload = {
-    model : 'gpt-4.1-mini',
-    input : [...inputArr, userMsg],
-    tools : [{ type:'image_generation' }]
-  };
-
-  const resp = JSON.parse(UrlFetchApp.fetch(
-    'https://api.openai.com/v1/responses',
-    {
-      method : 'post',
-      headers: { Authorization:'Bearer '+apiKey,
-                 'Content-Type':'application/json' },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions:true
-    }
-  ).getContentText());
-  
-  const tc = (resp.output || []).find(o => o.type === 'image_generation_call');
-  if (!tc) {
-    /* ↳ model returned plain text instead of an image — keep going */
-    const assistant = (resp.output || []).find(o => o.type === 'message');
-    const txt = assistant && assistant.content && assistant.content.length
-                ? (assistant.content[0].text || '').trim()
-                : '';
-    return { imageB64: '', toolCallObj: null, assistantText: txt };   // SAFELY FALL BACK
-  }
-
-
-  /* KEEP ONLY type + id  (discard the huge base-64 “result”) */
-  const stub = { type: tc.type, id: tc.id };
-
-  return { imageB64: tc.result, toolCallObj: stub };
-
+  const { urls } = getServiceConfig_();
+  if (!urls.imgGenCtx) return { imageB64:'', toolCallObj:null, assistantText:'Missing svc_images_generate_with_context' };
+  const svc = callServiceJsonUrl_(urls.imgGenCtx, {
+    inputArr, userPrompt, imgUrl, model: 'gpt-4.1-mini'
+  });
+  return { imageB64: svc.imageB64 || '', toolCallObj: svc.toolCallObj || null, assistantText: svc.assistantText || '' };
 }
 
 /* Extract the tool-call ID from an image_generation response body */
@@ -1289,43 +1222,15 @@ function Generate_COPY_FEED() {
   const t0 = Date.now();
 
   /*──── SETUP – keys ────*/
-  const setup = getNamedSetupValues_(['OPENAI_API_KEY','extract_copy_feed']);
-  const apiKey = setup.OPENAI_API_KEY || '';
+  const setup = getNamedSetupValues_(['extract_copy_feed']);
   const sysPrompt = setup.extract_copy_feed || '';
-  if (!apiKey || !sysPrompt) { safeAlert('SETUP missing OPENAI_API_KEY or extract_copy_feed'); return; }
+  const { urls: urlsCF } = getServiceConfig_();
+  if (!sysPrompt || !urlsCF.chatComplete) { safeAlert('SETUP missing extract_copy_feed or svc_chat_complete'); return; }
 
   /*──── source / target sheets ────*/
   const srcSh = getSheetByNameInsensitive_('REFINED_PROMPTS');
   if (!srcSh) { safeAlert('REFINED_PROMPTS sheet not found'); return; }
   const tgtSh = buildOrRefreshTargetSheet_('COPY_FEED', srcSh);
-
-  /*──── helper : single chat-completion ────*/
-  function runCopyAssistant_(userTxt){
-    const payload = {
-      model: 'gpt-4.1',
-      messages:[
-        {role:'system',content:sysPrompt},
-        {role:'user',  content:userTxt}
-      ]
-    };
-    for (let attempt=0;attempt<2;attempt++){
-      const resp = UrlFetchApp.fetch(
-        'https://api.openai.com/v1/chat/completions',{
-          method:'post',
-          headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},
-          payload:JSON.stringify(payload),
-          muteHttpExceptions:true
-        });
-      const raw = resp.getContentText();
-      if (resp.getResponseCode()!==200) { Utilities.sleep(RETRY_DELAY); continue; }
-      try{
-        const txt = JSON.parse(raw).choices[0].message.content || '';
-        return {text:txt, raw};
-      }catch(_){}
-      Utilities.sleep(RETRY_DELAY);
-    }
-    return {text:'',raw:'FAILED'};
-  }
 
   /*──── helper : logger ────*/
   function logCopy_(asin, header, status, userMsg, raw){
@@ -1336,47 +1241,53 @@ function Generate_COPY_FEED() {
     sh.appendRow([new Date(),asin,header,status,sysPrompt,userMsg,raw]);
   }
 
-  /*──── main double loop ────*/
   const lastRow = srcSh.getLastRow();
   const lastCol = srcSh.getLastColumn();
 
+  const tasks = [];
   for (let r=2;r<=lastRow;r++){
     const asin = String(srcSh.getRange(r,1).getValue()).trim();
     if (!asin) break;
-
     for (let c=2;c<=lastCol;c++){
-      const colHeader = header_(srcSh,c);
-      const userMsg = String(srcSh.getRange(r,c).getValue()).trim();
-
-      if (!userMsg){
-        /* early-terminate row if the rest is blank */
-        const restBlank = srcSh.getRange(r,c,lastCol-c+1).getValues()[0]
-                          .every(v=>!String(v).trim());
-        if (restBlank) break;
-        continue;
-      }
-
-      /* DISMISS shortcut */
-      if (/^dismiss/i.test(userMsg)){
-        tgtSh.getRange(r,c).setValue('DISMISSED');
-        continue;
-      }
-
-      /* GPT-4.1 call */
-      const {text,raw} = runCopyAssistant_(userMsg);
-      const status = text ? 'OK' : 'FAIL';
-      tgtSh.getRange(r,c).setValue(text || '');       // verbatim markdown line
-      logCopy_(asin,colHeader,status,userMsg,raw);
-
-      Utilities.sleep(RATE_DELAY);
-      if (Date.now()-t0 > MAX_RUNTIME_MS){
-        ScriptApp.newTrigger('Generate_COPY_FEED').timeBased().after(10000).create();
-        safeAlert('25-minute limit – COPY_FEED will resume in 10 s.');
-        return;
-      }
+      const header = header_(srcSh, c);
+      const cell = String(srcSh.getRange(r,c).getValue()).trim();
+      if (!cell) continue;
+      if (/^dismiss/i.test(cell)) { tgtSh.getRange(r,c).setValue('DISMISSED'); continue; }
+      if (String(tgtSh.getRange(r,c).getValue()).trim()) continue;
+      const prompt = `${sysPrompt}\n\n${cell}`;
+      tasks.push({ r, c, asin, header, userMsg: cell, prompt });
     }
   }
-  safeAlert('Generate COPY_FEED completed.');
+
+  const BATCH = 16;
+  for (let i=0;i<tasks.length;i+=BATCH){
+    const chunk = tasks.slice(i,i+BATCH);
+    const payloads = chunk.map(t=>({ model:'gpt-4.1', prompt: t.prompt }));
+    const results = fetchAllServiceJsonUrl_(urlsCF.chatComplete, payloads);
+
+    results.forEach((res, idx)=>{
+      const t = chunk[idx];
+      if (res.code !== 200) {
+        logCopy_(t.asin, t.header, 'FAIL', t.userMsg, res.body);
+        return;
+      }
+      let text='';
+      try { text = (JSON.parse(res.body).text||''); } catch(e){
+        logCopy_(t.asin, t.header, 'FAIL', t.userMsg, res.body);
+        return;
+      }
+      tgtSh.getRange(t.r,t.c).setValue(text);
+      logCopy_(t.asin, t.header, 'OK', t.userMsg, text);
+    });
+
+    if (Date.now() - t0 > MAX_RUNTIME_MS) {
+      ScriptApp.newTrigger('Generate_COPY_FEED').timeBased().after(10000).create();
+      safeAlert('Time limit reached – script will resume in 10 seconds.');
+      return;
+    }
+  }
+
+  safeAlert('Generate COPY_FEED finished.');
 }
 
 /*──────────────────────────────────────────────────────────────
