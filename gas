@@ -1,0 +1,1488 @@
+/**  Google Apps Script – Create MASTER_PROMPTS
+ *   – Adds “Image Master Agent Manual Mode → Create MASTER_PROMPTS” to the UI
+ *   – Builds / updates IMG_PROMPTS and fills it using an OpenAI Assistant (GPT-4o)
+ *   – Logs every request/response to LOG_Create MASTER_PROMPTS
+ *   – Column F in that log always stores the raw assistant response
+ *   – INITIAL_PROMPT_LOG sheet + helper removed
+ *   – Auto-resumes if runtime nears 30-min quota
+ * ------------------------------------------------------------------------- */
+const RATE_DELAY      = 10000;             // 10 s between normal calls
+const RETRY_DELAY     = 30000;             // 30 s before single retry
+const MAX_RUNTIME_MS  = 25 * 60 * 1000;    // stop at 25 min
+const LOG_SHEET       = 'LOG_Create MASTER_PROMPTS';
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Image Master Agent Manual Mode')
+    .addItem('Create MASTER_PROMPTS',  'Create_MASTER_PROMPTS')
+    .addItem('Get REFINED_PROMPTS',    'Get_to_REFINED_PROMPTS')
+    .addItem('Generate MASTER IMAGES', 'Generate_MASTER_IMAGES')
+    .addItem('Generate COPY_FEED',     'Generate_COPY_FEED')
+    .addItem('Create FIGMA_FEED',      'Create_FIGMA_FEED')   // ★ NEW
+    .addSeparator() // ← This line adds the separator
+    .addItem('Convert to Thumbnail Links', 'convertDriveLinks')
+    .addToUi();
+}
+
+
+/*────────────── MAIN ENTRY ─────────────*/
+function Create_MASTER_PROMPTS() {
+  const ss    = SpreadsheetApp.getActive();
+  const props = PropertiesService.getScriptProperties();
+  const t0    = Date.now();
+
+  /* ── AUTO-RESET (set to false if you ever need to resume) ── */
+  const ALWAYS_START_FRESH = true;
+  if (ALWAYS_START_FRESH) {
+    props.deleteProperty('THREAD_ID');
+    props.deleteProperty('INIT_DONE');
+  }
+
+  ensureSheet_(LOG_SHEET);
+
+  /* 1 -- Credentials & static prompts */
+  const setup = getNamedSetupValues_([
+    'OPENAI_API_KEY','assistant_id',
+    'initial_images_prompt','product_images_prompt',
+    'language_images'
+  ]);
+  const apiKey        = setup.OPENAI_API_KEY;
+  const assistantId   = setup.assistant_id;
+  const initialPrompt = setup.initial_images_prompt;
+  const perProdTpl    = setup.product_images_prompt;
+  const langCode      = setup.language_images;
+  if (!apiKey || !assistantId || !initialPrompt || !perProdTpl) {
+    safeAlert('SETUP sheet is missing required keys.');
+    return;
+  }
+
+  /* 2 -- IMG_PROMPTS sheet */
+  const imgSheet = getOrBuildImgSheet_(ss);
+
+  /* 3 -- Row to resume from */
+  const rangeA = imgSheet.getRange('A2:A').getValues();
+  let startRow = 2;
+  for (let i = 0; i < rangeA.length; i++) {
+    const rowIdx = i + 2;
+    if (rangeA[i][0] && !imgSheet.getRange(rowIdx, 2).getValue()) {
+      startRow = rowIdx;
+      break;
+    }
+  }
+
+  /* 4 -- Assistant thread (batch-aware) */
+  let threadId   = null;          // current thread
+  let batchCount = 0;             // products handled in this thread
+
+  const initMsg = expandInitialPrompt_(initialPrompt, ss, langCode);
+  {
+    // create first thread at start of run
+    const {threadId:tid, errorMsg} =
+          startNewThread_(apiKey, assistantId, initMsg);
+    if (!tid) { safeAlert('Initial assistant call failed – see log.'); return; }
+    threadId = tid;
+  }
+
+
+  /* 5 -- Loop through ASINs */
+  const lastRow    = imgSheet.getLastRow();
+  const themeCount = imgSheet.getLastColumn() - 2;   // B…(last-1)
+  const failed     = [];
+
+  for (let r = startRow; r <= lastRow; r++) {
+    const asin = imgSheet.getRange(r, 1).getValue();
+    if (!asin) break;
+
+    /* 🆕 Reset context every BATCH_SIZE products */
+    if (batchCount >= BATCH_SIZE) {
+      const { threadId: tid, errorMsg } =
+            startNewThread_(apiKey, assistantId, initMsg);
+      if (!tid) {                        // fatal – stop the script
+        failed.push(asin);
+        safeAlert('Batch re-initialisation failed – see log.');
+        break;
+      }
+      threadId   = tid;
+      batchCount = 0;
+    }
+
+
+    /* 5a – per-product prompt */
+    const productInfo = buildProductBlock_(asin);
+    const userPrompt  = perProdTpl.replace(/{{product}}/gi, productInfo);
+
+    /* 5b – assistant call with retry */
+    let answer = '';
+    try {
+      answer = runAssistant_(apiKey, assistantId, threadId, userPrompt);
+    } catch (e) {
+      Utilities.sleep(RETRY_DELAY);
+      try {
+        answer = runAssistant_(apiKey, assistantId, threadId, userPrompt);
+      } catch (err) {
+        failed.push(asin);
+        logCall_(asin, 'FAIL', userPrompt, String(err), '');
+        continue;
+      }
+    }
+
+    /* 5c – parse & write */
+    const expected = themeCount + 1;                 // themes + extra-tile
+    let prompts = parseMarkdownRow_(answer, expected);
+
+    // If we got some cells but not the full count, pad with blanks
+    if (prompts.length && prompts.length < expected) {
+      while (prompts.length < expected) prompts.push('');
+    }
+
+    // If nothing at all came back, mark this ASIN as failed
+    if (prompts.length === 0) {
+      failed.push(asin);
+      logCall_(asin, 'FAIL', userPrompt, 'Parse error – no usable cells', answer);
+      continue;
+    }
+
+    imgSheet.getRange(r, 2, 1, expected)
+            .setValues([prompts.slice(0, expected)]);
+    logCall_(asin, 'OK', userPrompt, '', answer);
+    batchCount++;   // 🆕 count this ASIN inside the current batch
+
+    Utilities.sleep(RATE_DELAY);
+
+    /* 5d – runtime guard */
+    if (Date.now() - t0 > MAX_RUNTIME_MS) {
+      ScriptApp.newTrigger('Create_MASTER_PROMPTS')
+               .timeBased().after(10000).create();
+      safeAlert('Time limit reached – script will resume in 10 seconds.');
+      return;
+    }
+  }
+
+  safeAlert('Create MASTER_PROMPTS finished.\nFailed ASINs: ' +
+          (failed.length ? failed.join(', ') : 'none'));
+}
+
+/*────────────── HELPERS ─────────────*/
+
+/* ensure a sheet exists, return it */
+function ensureSheet_(name) {
+  return getSheetByNameInsensitive_(name) || SpreadsheetApp.getActive().insertSheet(name);
+}
+
+/* SETUP values */
+function getNamedSetupValues_(keys) {
+  const sh  = getSheetByNameInsensitive_('SETUP');
+  const val = sh.getDataRange().getValues();
+  const map = {};
+  keys.forEach(k => map[k]='');
+  val.forEach(r => {
+    const k = String(r[0]).trim().toLowerCase();
+    keys.forEach(key => { if (k === key.toLowerCase()) map[key] = r[1];});
+  });
+  return map;
+}
+
+/* sheet matcher – letters + numbers only */
+function getSheetByNameInsensitive_(name) {
+  const norm = s => s.replace(/[^a-z0-9]/gi,'').toLowerCase();
+  const want = norm(name);
+  return SpreadsheetApp.getActive().getSheets()
+    .find(sh => norm(sh.getName()) === want);
+}
+
+/* IMG_PROMPTS builder / cloner */
+function getOrBuildImgSheet_(ss) {
+  const base = 'IMG_PROMPTS';
+  const existing = getSheetByNameInsensitive_(base);
+  const viaTrigger = !!ScriptApp.getProjectTriggers()
+                      .find(t => t.getHandlerFunction()==='Create_MASTER_PROMPTS');
+
+  if (existing) {
+    /* keep any links already present; just make sure header row is current */
+    existing.getRange(1, 1, 1, header.length).setValues([header]);
+    return existing;
+  }
+
+  const sh = ss.insertSheet(base);
+  const clean = getSheetByNameInsensitive_('CLEAN');
+  const asins = clean.getRange('A2:A'+clean.getLastRow()).getValues();
+  sh.getRange(2,1,asins.length,1).setValues(asins);
+  sh.getRange('A1').setValue('ASIN');
+
+  const themes = extractThemes_();
+  themes.forEach((t,i)=> sh.getRange(1,2+i).setValue(t));
+  sh.getRange(1,2+themes.length).setValue('Product extra tile');
+  return sh;
+}
+
+/* pull theme names */
+function extractThemes_() {
+  const fw  = getSheetByNameInsensitive_('FRAMEWORK_FINAL');
+  const hdr = fw.getRange(1,1,1,fw.getLastColumn()).getValues()[0];
+  const idx = hdr.findIndex(c=>String(c).toLowerCase().includes('theme'));
+  if (idx===-1) throw new Error('No “theme” column in FRAMEWORK_FINAL');
+  return fw.getRange(2,idx+1,fw.getLastRow()-1,1).getValues()
+           .flat().filter(String);
+}
+
+/* build big framework prompt */
+function expandInitialPrompt_(tpl, ss, langCode){
+  return tpl
+    .replace(/{{framework}}/gi,sheetToMD_(getSheetByNameInsensitive_('FRAMEWORK_FINAL')))
+    .replace(/{{brand}}/gi,buildBrandLine_())
+    .replace(/{{prompts}}/gi,buildPromptBankBlock_())
+    .replace(/{{language}}/gi,langCode);
+}
+
+/* sheet → markdown table */
+function sheetToMD_(sh){
+  return sh.getDataRange().getValues()
+           .map(r=>'| '+r.join(' | ')+' |').join('\n');
+}
+
+/* brand one-liner */
+function buildBrandLine_(){
+  const sh   = getSheetByNameInsensitive_('GENERAL_BRAND');
+  const vals = sh.getDataRange().getValues();
+  const out  = [];
+  for (let c=0;c<vals[0].length;c++){
+    if(!vals[0][c]) break;
+    for(let r=0;r<vals.length;r++){
+      if(!vals[r][c]) break;
+      out.push(vals[r][c]);
+    }
+  }
+  return out.join(', ');
+}
+
+/* first 3 rows of each full column in PROMPTS_BANK */
+function buildPromptBankBlock_(){
+  const sh   = getSheetByNameInsensitive_('PROMPTS_BANK');
+  const maxC = sh.getLastColumn();
+  const out  = [];
+  for(let c=1;c<=maxC;c++){
+    const col=sh.getRange(1,c,3,1).getValues().flat();
+    if(col.every(v=>v)) out.push(col.join(' / '));
+  }
+  return out.join('\n');
+}
+
+/* product block builder */
+/*───────────────────────────────────────────────────────────────
+ * buildProductBlock_(asin)
+ * • Returns a single comma-separated string describing the product.
+ * • NEW rules:
+ *     1. Skip any column whose header (row 1) OR sub-header (row 2) is “BLOB”.
+ *     2. Skip any cell whose text starts with “http”.
+ *     3. Skip cells shorter than 10 characters (unchanged).
+ *───────────────────────────────────────────────────────────────*/
+function buildProductBlock_(asin) {
+  const clean = getSheetByNameInsensitive_('CLEAN');
+  if (!clean) return asin;                           // safety net
+
+  const values   = clean.getDataRange().getValues(); // full sheet
+  const headers1 = values[0];                        // row 1
+  const headers2 = values[1] || [];                  // row 2 (may be blank)
+
+  /* ── 1. collect column indexes whose header OR sub-header is “BLOB” ── */
+  const banned = new Set();
+  const isBlob = s => String(s).trim().toUpperCase() === 'BLOB';
+  headers1.forEach((h, i) => { if (isBlob(h)) banned.add(i); });
+  headers2.forEach((h, i) => { if (isBlob(h)) banned.add(i); });
+
+  /* ── 2. find the requested ASIN row ── */
+  const row = values.find(r => r[0] === asin);
+  if (!row) return asin;                             // ASIN not found
+
+  /* ── 3. build the output string with new filters ── */
+  const parts = row
+    .map((cell, idx) => ({ cell, idx }))             // keep index
+    .filter(o => !banned.has(o.idx))                 // skip BLOB columns
+    .map(o => String(o.cell).trim())
+    .filter(text =>
+      text &&                                        // non-empty
+      !text.startsWith('http') &&                    // rule #2
+      text.length > 10                               // rule #3 (existing)
+    );
+
+  return parts.length ? parts.join(', ') : asin;     // fallback to ASIN
+}
+
+/* Parse a ONE-ROW markdown table robustly.
+ * – Flattens stray line-breaks that appear *inside* cells
+ * – Accepts rows even if the trailing “|” was forgotten
+ * – Pads / truncates to `expectedCount`
+ */
+function parseMarkdownRow_(txt, expectedCount) {
+  if (!txt) return [];
+
+  /* 1️⃣  Flatten: change any newline **not** followed by a pipe
+         into a single space so the row becomes one physical line. */
+  txt = txt.replace(/\r?\n(?!\s*\|)/g, ' ');
+
+  /* 2️⃣  Get the first pipe-started line (now guaranteed 1-liner) */
+  const row = txt.split(/\r?\n/)
+                 .map(l => l.trim())
+                 .find(l => l.startsWith('|'));
+  if (!row) return [];
+
+  /* 3️⃣  Ensure there’s a trailing pipe so “split” keeps last cell */
+  const safeRow = row.endsWith('|') ? row : row + ' |';
+
+  /* 4️⃣  Split & tidy */
+  const cells = safeRow
+    .replace(/^\|/, '')          // drop leading pipe
+    .replace(/\|$/, '')          // drop trailing pipe
+    .split('|')
+    .map(c => c.trim());
+
+  /* 5️⃣  Pad or trim to the exact column count requested */
+  while (cells.length < expectedCount) cells.push('');
+  return cells.slice(0, expectedCount);
+}
+
+
+/*──────── OpenAI helpers ────────*/
+function oaHeaders_(key){
+  return {
+    Authorization:'Bearer '+key,
+    'Content-Type':'application/json',
+    'OpenAI-Beta':'assistants=v2'
+  };
+}
+
+function createThread_(key){
+  return JSON.parse(UrlFetchApp.fetch('https://api.openai.com/v1/threads',{
+    method:'post',headers:oaHeaders_(key),payload:'{}'
+  })).id;
+}
+
+/*────────────────────────────────────────────────────────────
+ * startNewThread_(apiKey, assistantId, initMsg)
+ * – Creates a brand-new thread
+ * – Sends the framework “initial” prompt
+ * – Returns {threadId, errorMsg}  (errorMsg is '' on success)
+ * – All logging done here so caller stays clean
+ *────────────────────────────────────────────────────────────*/
+function startNewThread_(apiKey, assistantId, initMsg) {
+  try {
+    const threadId = createThread_(apiKey);
+    const initResp = runAssistant_(apiKey, assistantId, threadId, initMsg);
+    logCall_('INITIAL', 'OK', initMsg, '', initResp);
+    return { threadId, errorMsg: '' };
+  } catch (e) {
+    logCall_('INITIAL', 'FAIL', initMsg, String(e), '');
+    return { threadId: null, errorMsg: String(e) };
+  }
+}
+
+/*────────────────  ROBUST & VERBOSE Assistant runner  ────────────────
+ * • Retries automatically if a previous run is still active in the thread.
+ * • Creates the run with generous generation limits so each theme prompt
+ *   can be 80–120 words (≈600-700 tokens for 11 columns).
+ * • Returns the assistant’s reply text (first assistant message after the run).
+ */
+function runAssistant_(apiKey, assistantId, threadId, userMsg) {
+  const base    = 'https://api.openai.com/v1';
+  const headers = oaHeaders_(apiKey);
+
+  /* ── utility: wait until a runId is COMPLETED ── */
+  function waitRun(runId) {
+    while (true) {
+      const stat = JSON.parse(
+        UrlFetchApp.fetch(`${base}/threads/${threadId}/runs/${runId}`, {headers})
+      );
+      if (stat.status === 'completed') return;
+      if (['requires_action','failed','cancelled','expired'].includes(stat.status))
+        throw new Error('Run failed: ' + stat.status);
+      Utilities.sleep(2000);                                      // poll every 2 s
+    }
+  }
+
+  /* ── 1. add user message, handle “run active” once ── */
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      UrlFetchApp.fetch(`${base}/threads/${threadId}/messages`, {
+        method : 'post',
+        headers,
+        payload: JSON.stringify({ role: 'user', content: userMsg })
+      });
+      break;                                                     // success
+    } catch (e) {
+      const msg = e instanceof UrlFetchApp.HTTPException ? e.toString() : '';
+      if (attempt === 0 && msg.includes('while a run')) {        // 400 blocker
+        const runId = (msg.match(/run_[\w\-]+/) || [])[0];
+        if (runId) { waitRun(runId); continue; }                 // wait & retry
+      }
+      throw e;                                                   // other error
+    }
+  }
+
+  /* 2. create run (no extra params — they live on the assistant) */
+  const runId = JSON.parse(
+    UrlFetchApp.fetch(`${base}/threads/${threadId}/runs`, {
+       method : 'post',
+       headers,
+       payload: JSON.stringify({ assistant_id: assistantId })
+    })
+  ).id;
+
+  /* ── 3. wait for run to finish ── */
+  waitRun(runId);
+
+  /* ── 4. fetch latest assistant reply ── */
+  const msgs = JSON.parse(
+    UrlFetchApp.fetch(`${base}/threads/${threadId}/messages?limit=10`, {headers})
+  ).data;
+  const reply = msgs.find(m => m.role === 'assistant');
+  return reply?.content?.[0]?.text?.value || '';
+}
+
+/*──────── Logging helper ────────
+ * A Timestamp
+ * B ASIN / “INITIAL”
+ * C Status (OK / FAIL)
+ * D User prompt
+ * E Info / Error (blank on success)
+ * F Raw assistant response (always recorded) */
+function logCall_(asin, status, req, info, rawResp){
+  ensureSheet_(LOG_SHEET)
+    .appendRow([new Date(), asin, status, req, info, rawResp]);
+}
+
+/*──────── Reset helper ────────*/
+function Reset_ImageMasterThread() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('THREAD_ID');
+  props.deleteProperty('INIT_DONE');
+  Logger.log('Thread + INIT flags cleared.');
+
+  // show a toast only if a spreadsheet is open
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (ss) ss.toast('Thread + INIT flags cleared. Ready to run.');
+}
+
+/*──────────────────────────────────────────────────────────────
+ * safeAlert(msg)
+ * – When a spreadsheet UI is available, shows a toast.
+ * – When head-less (trigger context) just logs.
+ * – Never calls SpreadsheetApp.getUi().
+ *──────────────────────────────────────────────────────────────*/
+function safeAlert(msg) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (ss) {
+    try { ss.toast(msg, 'Info', 10); } catch (_) { Logger.log(msg); }
+  } else {
+    Logger.log(msg);
+  }
+}
+
+
+/*─────────────────────────────────────────────────────────────────────────────
+ * Get_to_REFINED_PROMPTS   –  UPDATED (skip “REVCOUNT” columns)
+ * • Builds the REFINED_PROMPTS sheet from IMG_PROMPTS
+ * • One chat-completion (model “o3”) per product
+ * • Columns whose header (row 1) in CLEAN equals “REVCOUNT” (case-insensitive)
+ *   are ignored when assembling {product_information}
+ * • Raw assistant reply is always logged in column F of LOG_Get REFINED_PROMPTS
+ *─────────────────────────────────────────────────────────────────────────────*/
+function Get_to_REFINED_PROMPTS() {
+  const ss = SpreadsheetApp.getActive();
+
+  /* 0️⃣  SETUP ****************************************************************/
+  const setup = getNamedSetupValues_([
+    'OPENAI_API_KEY',
+    'refine_prompts_prompt',
+    'graphical_guidelines',
+    'prompts_examples',
+    'number_of_new_tiles',
+    'language_images'
+  ]);
+  const apiKey         = setup.OPENAI_API_KEY;
+  const tplPrompt      = setup.refine_prompts_prompt;
+  const graphicalGuide = setup.graphical_guidelines || '';
+  const colNumsRaw     = setup.prompts_examples   || '';
+  const numberTiles    = setup.number_of_new_tiles|| '';
+  const langCode       = setup.language_images    || '';
+  if (!apiKey || !tplPrompt) {
+    safeAlert('SETUP sheet is missing OPENAI_API_KEY or refine_prompts_prompt.');
+    return;
+  }
+
+  /* 0a – SPECIFIC TILE n ******************************************************/
+  const specTiles=[];
+  getSheetByNameInsensitive_('SETUP')
+    .getDataRange().getValues()
+    .forEach(r=>{
+      const m=String(r[0]).trim().match(/^specific_tile_(\d+)$/i);
+      if(m&&r[1]) specTiles.push({n:+m[1],text:String(r[1])});
+    });
+  specTiles.sort((a,b)=>a.n-b.n);
+
+  /* 1️⃣  SOURCE / TARGET sheets ***********************************************/
+  const imgSh=getSheetByNameInsensitive_('IMG_PROMPTS');
+  if(!imgSh){safeAlert('IMG_PROMPTS sheet not found.');return;}
+
+  const refName='REFINED_PROMPTS';
+  let refSh=getSheetByNameInsensitive_(refName);
+  refSh?refSh.clear():refSh=ss.insertSheet(refName);
+
+  const baseHdr=imgSh.getRange(1,1,1,imgSh.getLastColumn()).getValues()[0];
+  const specHdr=specTiles.map(t=>`SPECIFIC TILE ${t.n}`);
+  refSh.getRange(1,1,1,baseHdr.length+specHdr.length)
+       .setValues([baseHdr.concat(specHdr)]);
+
+  /* 2️⃣  PROMPTS_BANK example blocks ******************************************/
+  const exCols=colNumsRaw.split(',').map(s=>parseInt(s.trim(),10))
+                         .filter(n=>!isNaN(n)&&n>0);
+  const pbSh=getSheetByNameInsensitive_('PROMPTS_BANK');
+  const examplesJoined=exCols.map(idx=>{
+      const col=pbSh?pbSh.getRange(1,idx,pbSh.getLastRow(),1).getValues():[];
+      return col.flat().filter(String).join('\n');
+  }).filter(String).join('\n');
+
+  /* 3️⃣  CLEAN sheet & “REVCOUNT” filter **************************************/
+  const cleanSh   = getSheetByNameInsensitive_('CLEAN');
+  const cleanVals = cleanSh ? cleanSh.getDataRange().getValues() : [];
+  const revIdxSet = new Set();
+  if(cleanVals.length){
+    cleanVals[0].forEach((h,i)=>{
+      if(String(h).trim().toUpperCase()==='REVCOUNT') revIdxSet.add(i);
+    });
+  }
+
+  /* 4️⃣  LOG helper ***********************************************************/
+  const LOG_SHEET2='LOG_Get REFINED_PROMPTS';
+  function logRefined_(asin,status,req,info,res){
+    ensureSheet_(LOG_SHEET2)
+      .appendRow([new Date(),asin,status,req,info,res]);
+  }
+
+  /* 5️⃣  Main loop ************************************************************/
+  const lastRow=imgSh.getLastRow();
+  const expectedBaseCols=imgSh.getLastColumn()-1;
+  const expectedCount   =expectedBaseCols+specTiles.length;
+
+  for(let r=2;r<=lastRow;r++){
+    const asin=imgSh.getRange(r,1).getValue();
+    if(!asin)break;
+
+    /* product_information (skip REVCOUNT columns) */
+    let productInfo=asin;
+    if(cleanVals.length){
+      const row=cleanVals.find(v=>v[0]===asin);
+      if(row){
+        productInfo=row.map((cell,idx)=>({cell:String(cell).trim(),idx}))
+                        .filter(o=>o.idx!==0 && !revIdxSet.has(o.idx))
+                        .map(o=>o.cell)
+                        .filter(s=>s.length>=8 && !s.toLowerCase().startsWith('http'))
+                        .join(' / ');
+      }
+    }
+
+    /* draft_prompts markdown */
+    const draftVals=imgSh.getRange(r,2,1,expectedBaseCols).getValues()[0]
+                        .map(c=>String(c).trim());
+    const draftRow='| '+draftVals.join(' | ')+' |';
+
+    /* spec_tiles block */
+    const specBlock=specTiles.map(t=>`SPECIFIC TILE ${t.n}\n${t.text}`).join('\n');
+
+    /* build user prompt */
+    const vars={
+      product_information:productInfo,
+      draft_prompts:draftRow,
+      graphical_guidelines:graphicalGuide,
+      prompt_examples:examplesJoined,
+      number_tiles:numberTiles,
+      spec_tiles:specBlock,
+      language_images:langCode
+    };
+    let promptTxt=tplPrompt;
+    Object.entries(vars).forEach(([k,v])=>{
+      promptTxt=promptTxt.replace(new RegExp('\\{'+k+'\\}','gi'),v||'');
+    });
+
+    /* call OpenAI ***********************************************************/
+    const payload={model:'o3',messages:[{role:'user',content:promptTxt}]};
+    const headers={Authorization:'Bearer '+apiKey,'Content-Type':'application/json'};
+    const response=UrlFetchApp.fetch(
+      'https://api.openai.com/v1/chat/completions',{
+        method:'post',headers,payload:JSON.stringify(payload),muteHttpExceptions:true
+      });
+    const code=response.getResponseCode();
+    const body=response.getContentText();
+
+    if(code!==200){
+      logRefined_(asin,'FAIL',promptTxt,'HTTP '+code,body);
+      continue;
+    }
+
+    let answer='';
+    try{
+      const json=JSON.parse(body);
+      answer=json.choices?.[0]?.message?.content||'';
+    }catch(e){
+      logRefined_(asin,'FAIL',promptTxt,'JSON parse error',body);
+      continue;
+    }
+
+    const cells=parseMarkdownRow_(answer,expectedCount);
+    if(cells.length===0){
+      logRefined_(asin,'FAIL',promptTxt,'Parse error – no usable cells',answer);
+      continue;
+    }
+
+    refSh.getRange(r,1,1,1+expectedCount)
+         .setValues([[asin].concat(cells.slice(0,expectedCount))]);
+    logRefined_(asin,'OK',promptTxt,'',answer);
+
+    Utilities.sleep(RATE_DELAY);
+  }
+
+  safeAlert('Get REFINED_PROMPTS finished.');
+
+}
+
+
+
+/**  Google Apps Script – Generate MASTER_IMAGES
+ *   – Source sheet   :  REFINED_PROMPTS   (prompts already curated)
+ *   – Output sheets  :  MASTER_IMAGES  +  MASTER_BACKGROUND
+ *   – One image pair per non-DISMISS prompt            (main + bg)
+ *   – Images are generated via Chat-Completions (model "gpt-4o")
+ *       • 1st request → system + user (“main”) message       → _main_
+ *       • 2nd request → user (“background”) message only     → _bg_
+ *   – Files saved in Drive folder  **MASTER_IMAGES**
+ *   – Links written in both output sheets using the short
+ *     `https://drive.google.com/uc?export=view&id=` format
+ *   – Stops after 25 min and self-re-schedules (resume finds first blank cell)
+ * ------------------------------------------------------------------------- */
+const IMG_RATE_DELAY  = 10000;            // 10 s between calls
+const IMG_RETRY_DELAY = 30000;            // 30 s single retry
+const IMG_MAX_RUNTIME = 25 * 60 * 1000;   // stop at 25 min
+const LOG_IMG_SHEET   = 'LOG_Generate MASTER_IMAGES';
+const BATCH_SIZE     = 2;              // ← how many ASINs per thread
+
+/* Return { assistantMsg , toolStub }
+ *  – assistantMsg = the full assistant message object (role:'assistant', …)
+ *  – toolStub     = { type:'image_generation_call', id:'…' }           */
+function contextFromHeroRaw_(rawJson) {
+  try {
+    const j  = JSON.parse(rawJson);
+    const out = { assistantMsg:null, toolStub:null };
+
+    (j.output || []).forEach(o => {
+      if (o.role === 'assistant') out.assistantMsg = o;          // full msg
+      if (o.type === 'image_generation_call')
+        out.toolStub = { type:o.type, id:o.id };                 // trimmed
+    });
+    return out;
+  } catch (_) {
+    return { assistantMsg:null, toolStub:null };
+  }
+}
+
+
+/*──────────────────────────────────────────────────────────────*/
+function Generate_MASTER_IMAGES() {
+  const ss      = SpreadsheetApp.getActive();
+  const t0      = Date.now();
+
+  /*────────  SETUP  ────────*/
+  const setup = getNamedSetupValues_([
+    'OPENAI_API_KEY',
+    'make_images_prompt_system',
+    'make_images_prompt_user',
+    'make_background_user',
+    'make_overlay_user',           // ★ NEW
+    'graphical_guidelines'
+  ]);
+
+  const apiKey      = setup.OPENAI_API_KEY || '';
+  const sysTpl      = setup.make_images_prompt_system || '';
+  const usrTpl      = setup.make_images_prompt_user   || '';
+  const bgTpl       = setup.make_background_user      || '';
+  const guidelines  = setup.graphical_guidelines      || '';
+
+  const olTpl       = setup.make_overlay_user || '';            // ★ NEW
+  if (!olTpl) { safeAlert('SETUP sheet missing make_overlay_user.'); return; }
+  if (!apiKey || !sysTpl || !usrTpl || !bgTpl) {
+    safeAlert('SETUP sheet missing required keys.'); return;
+  }
+
+  /*────────  SHEETS  ────────*/
+  const promSh   = getSheetByNameInsensitive_('REFINED_PROMPTS');
+  if (!promSh) { safeAlert('REFINED_PROMPTS sheet not found.'); return; }
+
+  const imgSh    = buildOrRefreshTargetSheet_('MASTER_IMAGES',      promSh);
+  const bgSh     = buildOrRefreshTargetSheet_('MASTER_BACKGROUND',  promSh);
+  const olSh     = buildOrRefreshTargetSheet_('MASTER_OVERLAY',    promSh);
+
+  /*────────  CLEAN lookup for {product_image}  ────────*/
+  const cleanSh  = getSheetByNameInsensitive_('CLEAN');
+  const imgUrlCol = findColumnByHeader_(cleanSh, 'Image_URL');
+  if (imgUrlCol === -1) {
+    safeAlert('Image_URL column not found in CLEAN sheet.'); return;
+  }
+  const cleanVals = cleanSh.getDataRange().getValues();   // cached for speed
+
+  /*────────  DRIVE folder  ────────*/
+  const folder = getOrCreateFolder_(ss, 'MASTER_IMAGES');
+
+  /*────────  MAIN loop  ────────*/
+  const lastRow = promSh.getLastRow();
+  const lastCol = promSh.getLastColumn();
+
+  for (let r = 2; r <= lastRow; r++) {
+    const asin = String(promSh.getRange(r,1).getValue()).trim();
+    if (!asin) break;
+
+    /* per-row image index n */
+    let imgIdx = 1;
+
+    for (let c = 2; c <= lastCol; c++) {
+      const colHeader = header_(promSh, c);      // first line inside the loop
+
+      let heroUrl = '';                      // ★ will hold the main link
+
+
+      const prompt = String(promSh.getRange(r, c).getValue()).trim();
+      if (!prompt) {
+        const remainder = promSh.getRange(r, c, lastCol - c + 1).getValues()[0]
+                          .every(v => !String(v).trim());
+        if (remainder) break;
+        continue;
+      }
+
+      if (String(imgSh.getRange(r, c).getValue()).trim()) continue;
+      if (/^dismiss/i.test(prompt)) {
+        imgSh.getRange(r, c).setValue('DISMISSED');
+        bgSh .getRange(r, c).setValue('DISMISSED');
+        olSh .getRange(r, c).setValue('DISMISSED');
+        continue;
+      }
+
+      /* -------- build messages -------- */
+      const prodImage = lookupCleanUrl_(asin, imgUrlCol, cleanVals) || '';
+      const sysMsg    = sysTpl.replace(/\{graphical_guidelines\}/gi, guidelines);
+      const userMain  = (usrTpl.replace(/\{product_image\}/gi, prodImage) +
+                        '\n' + prompt).trim();
+      const userBg    = bgTpl.trim();
+
+      /* ========== MAIN image call ========== */
+      const main = generateImage_(apiKey, sysMsg, userMain, prodImage);
+
+      /* log MAIN immediately (OK or FAIL) */
+      const mainStatus = main.b64 ? 'MAIN-OK' : 'FAIL-MAIN';
+      logImg_(asin, colHeader, mainStatus, sysMsg, userMain, main.raw);
+
+      if (!main.b64) {                        // ⇣ write placeholders, then skip BG/OL
+        imgSh.getRange(r, c).setValue('FAIL');
+        bgSh .getRange(r, c).setValue('FAIL');
+
+        /* try to capture any assistant text so you see WHY it failed */
+        let explain = 'FAIL';
+        try {
+          const j   = JSON.parse(main.raw || '{}');
+          const msg = (j.output || []).find(o => o.type === 'message');
+          explain   = (msg && msg.content && msg.content.length)
+                      ? (msg.content[0].text || '').trim() || 'FAIL'
+                      : 'FAIL';
+        } catch (_) { /* keep 'FAIL' */ }
+
+        olSh.getRange(r, c).setValue(explain);
+        continue;                                   // move on to next prompt
+      }
+
+
+      heroUrl = saveB64_(folder,                      // ★ save into loop var
+                  `${asin}_${imgIdx}_main_${colHeader}.png`, main.b64);
+      imgSh.getRange(r, c).setValue(heroUrl);
+
+
+      /* ---- build full context for BG turn ---- */
+      const ctxParts = contextFromHeroRaw_(main.raw);
+      const contextArr = [];
+
+      /* keep only the tool-call stub – no assistantMsg → no guidelines noise */
+      if (ctxParts.toolStub) contextArr.push(ctxParts.toolStub);
+
+
+      /* ========== BACKGROUND image call (same chat) ========== */
+      const bg = runImageGenerationWithContext_(apiKey,
+              contextArr,             // previous turn (assistant + tool)
+              userBg,                 // our BG prompt
+              prodImage);             // SAME product image
+
+
+      /* log BG immediately */
+      const bgStatus = bg.imageB64 ? 'BG-OK' : 'FAIL-BG';
+      logImg_(asin, colHeader, bgStatus, sysMsg, userBg,
+              bg.toolCallObj ? JSON.stringify(bg.toolCallObj) : '');
+
+      if (!bg.imageB64) {
+        bgSh.getRange(r, c).setValue('FAIL');   // record the failure
+        continue;
+      }
+
+
+      const bgUrl = saveB64_(folder,
+                    `${asin}_${imgIdx}_bg_${colHeader}.png`, bg.imageB64);
+      bgSh.getRange(r, c).setValue(bgUrl);
+
+
+      /* ---------- overlay (OL) ---------- */
+      if (heroUrl && !olSh.getRange(r, c).getValue()) {
+        const ol = generateImage_(apiKey, '', olTpl, heroUrl);  // no system
+
+        const olStatus = ol.b64 ? 'OL-OK' : 'FAIL-OL';
+        logImg_(asin, colHeader, olStatus, '', olTpl, ol.raw);
+
+        if (ol.b64) {
+          const olUrl = saveB64_(folder,
+                     `${asin}_${imgIdx}_ol_${colHeader}.png`, ol.b64);
+          olSh.getRange(r, c).setValue(olUrl);
+        } else {
+          /* fall-back text if the model declined to create an overlay */
+          let txt = 'FAIL';
+          try {
+            const j   = JSON.parse(ol.raw || '{}');
+            const msg = (j.output || []).find(o => o.type === 'message');
+            txt = (msg && msg.content && msg.content.length)
+                  ? (msg.content[0].text || '').trim() || 'FAIL'
+                  : 'FAIL';
+          } catch (_) {}
+          olSh.getRange(r, c).setValue(txt);
+        }
+      }
+
+
+      imgIdx++;
+      Utilities.sleep(IMG_RATE_DELAY);
+      if (Date.now() - t0 > IMG_MAX_RUNTIME) { scheduleResume_(); return; }
+
+    }
+  }
+}
+/*──────────────────────────────────────────────────────────────*/
+/* Build or refresh a target sheet using REFINED_PROMPTS header */
+function buildOrRefreshTargetSheet_(name, sourceSh) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = getSheetByNameInsensitive_(name);
+  if (!sh) sh = ss.insertSheet(name);
+  
+  /* header */
+  const hdr = sourceSh.getRange(1,1,1,sourceSh.getLastColumn()).getValues()[0];
+  sh.getRange(1,1,1,hdr.length).setValues([hdr]);
+
+  /* ASIN column */
+  const asins = sourceSh.getRange(2,1,sourceSh.getLastRow()-1,1).getValues();
+  sh.getRange(2,1,asins.length,1).setValues(asins);
+  return sh;
+}
+
+/*──────────────────────────────────────────────────────────────*/
+/* Query CLEAN sheet for product-image URL */
+function lookupCleanUrl_(asin, colIdx, vals){
+  const row = vals.find(v=>String(v[0]).trim().toLowerCase() === asin.toLowerCase());
+  return row ? String(row[colIdx-1]).trim() : '';
+}
+
+/*──────────────────────────────────────────────────────────────
+ *  NEW: detailed image call – returns {b64, raw}
+ *──────────────────────────────────────────────────────────────*/
+function generateImage_(apiKey, systemTxt, userTxt, prodImgUrl) {
+  const inputArr = [];
+  if (systemTxt) inputArr.push({ role:'system', content: systemTxt });
+
+  const userContent = [{ type:'input_text', text: userTxt }];
+  if (prodImgUrl) userContent.push({ type:'input_image', image_url: prodImgUrl });
+  inputArr.push({ role:'user', content: userContent });
+
+  const payload = { model:'gpt-4o', input:inputArr, tools:[{type:'image_generation'}] };
+  let lastRaw = '';
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const resp   = UrlFetchApp.fetch('https://api.openai.com/v1/responses', {
+                     method:'post',
+                     headers:{ Authorization:'Bearer '+apiKey,
+                               'Content-Type':'application/json' },
+                     payload:JSON.stringify(payload),
+                     muteHttpExceptions:true
+                   });
+    lastRaw      = resp.getContentText();
+
+    if (resp.getResponseCode() !== 200) { Utilities.sleep(IMG_RETRY_DELAY); continue; }
+
+    try {
+      const json = JSON.parse(lastRaw);
+      const tc   = (json.output || []).find(o => o.type === 'image_generation_call');
+      if (tc && tc.result) return { b64: tc.result, raw: lastRaw };
+    } catch (_) { /* fall through and retry once */ }
+
+    Utilities.sleep(IMG_RETRY_DELAY);
+  }
+  return { b64:'', raw:lastRaw };      // even on hard fail, give back raw text
+}
+
+/*──────────────────────────────────────────────────────────────*/
+/* Save base64→Drive and return short view link */
+function saveB64_(folder, fname, b64){
+  const blob = Utilities.newBlob(Utilities.base64Decode(b64),'image/png',fname);
+  const file = folder.createFile(blob)
+              .setSharing(DriveApp.Access.ANYONE_WITH_LINK,DriveApp.Permission.VIEW);
+  return 'https://drive.google.com/uc?export=view&id='+file.getId();
+}
+
+/*──────────────────────────────────────────────────────────────*/
+/* Return (and create if needed) a sub-folder named {name}
+ * right next to the spreadsheet file itself. */
+function getOrCreateFolder_(ss, name) {
+  const ssFile  = DriveApp.getFileById(ss.getId());     // ★ convert
+  const parents = ssFile.getParents();                  // Drive iterator
+  const parent  = parents.hasNext()
+                  ? parents.next()                      // same folder as the sheet
+                  : DriveApp.getRootFolder();           // fallback
+
+  const it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+
+/*──────────────────────────────────────────────────────────────*/
+function header_(sh,col){ return String(sh.getRange(1,col).getValue()).trim(); }
+
+/* richer logger: system msg, user msg, raw body */
+function logImg_(asin, header, status, systemMsg, userMsg, rawResp) {
+
+  /* 🔹 NEW: remove the "result":"<base64…>" field before writing */
+  rawResp = String(rawResp).replace(
+              /"result"\s*:\s*"[^"]*"/g,   // everything from "result":" … "
+              '"result":"[omitted]"'        // keep the key, drop the blob
+            );
+
+  const sh = ensureSheet_(LOG_IMG_SHEET);
+
+  /* first run → add detailed header once */
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['Timestamp','ASIN','Header','Status',
+                  'System msg','User msg','OpenAI raw']);
+  }
+
+  sh.appendRow([new Date(), asin, header, status,
+                systemMsg, userMsg, rawResp]);
+}
+
+
+/*──────────────────────────────────────────────────────────────
+ * Reschedule the script 5 s later and notify the user only if
+ * a spreadsheet UI is actually available.
+ *──────────────────────────────────────────────────────────────*/
+function scheduleResume_() {
+  ScriptApp.newTrigger('Generate_MASTER_IMAGES')
+           .timeBased().after(5000).create();
+  safeAlert('25-minute limit reached – script will resume in 5 seconds.');
+}
+
+
+/*────────────────────  Vision + Tool image generation  ────────────────────
+ * • Sees the pack-shot (file_id) and calls the "image_generation" tool in
+ *   the same request, so gpt-image-1 faithfully reproduces the new carton.
+ * • Returns { imageB64, callId } for follow-up edits.                         */
+function runImageGeneration_(apiKey, fullPrompt, fileId) {
+  const url = 'https://api.openai.com/v1/responses';
+  const payload = {
+    model : 'gpt-4.1-mini',
+    input : [
+      {
+        role    : 'user',
+        content : [
+          { type : 'input_text',  text   : fullPrompt },
+          { type : 'input_image', file_id: fileId    }   // Vision!
+        ]
+      }
+    ],
+    tools : [{ type:'image_generation' }]
+  };
+
+
+  const resp = JSON.parse(
+    UrlFetchApp.fetch(url, {
+      method  : 'post',
+      headers : {
+        Authorization : 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      },
+      payload            : JSON.stringify(payload),
+      muteHttpExceptions : true
+    }).getContentText()
+  );
+
+  const imgCall = (resp.output || [])
+                    .find(o => o.type === 'image_generation_call');
+  if (!imgCall)
+    throw new Error('No image_generation_call returned.\n' + JSON.stringify(resp));
+
+  return { imageB64: imgCall.result, callId: imgCall.id };
+}
+
+/*────────────── Drive helper ───────────────*/
+function saveImageToDrive_(asin, colIdxMinus1, imageB64) {
+  const ssFile   = DriveApp.getFileById(SpreadsheetApp.getActive().getId());
+  const parent   = ssFile.getParents().hasNext() ? ssFile.getParents().next() : DriveApp.getRootFolder();
+  const folder   = getOrCreateSubFolder_(parent, 'Images_');
+  const blob     = Utilities.newBlob(Utilities.base64Decode(imageB64), 'image/png', `${asin}_${colIdxMinus1}.png`);
+  const file     = folder.createFile(blob).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return file.getUrl();
+}
+
+/*────────────── Folder helper – Images_n ───────────────*/
+function getOrCreateSubFolder_(parent, baseName) {
+  let n = 1;
+  while (true) {
+    const name = baseName + n;
+    const existing = parent.getFoldersByName(name);
+    if (existing.hasNext()) {
+      if (existing.next().getFiles().hasNext()) { n++; continue; }  // occupied – bump index
+      return existing.next();                                       // empty reuse
+    }
+    return parent.createFolder(name);                               // fresh
+  }
+}
+
+/*────────────── Sheet cloning / building ───────────────*/
+/*──────── Build or clone IMG_LINKS / IMG_PREVIEWS ────────
+ * base  = "IMG_LINKS" or "IMG_PREVIEWS"
+ * promSh = the IMG_PROMPTS sheet
+ * addGuidelineCol = true  → insert the “Graphical guidelines” column (col B)
+ */
+function getOrBuildImageSheet_(base, promSh, addGuidelineCol=false) {
+
+  /* ---- clone-when-manual logic (same as before) ---- */
+  const viaTrigger = !!ScriptApp.getProjectTriggers()
+                     .find(t => t.getHandlerFunction() === 'Generate_MASTER_IMAGES');
+  const existing   = getSheetByNameInsensitive_(base);
+  const ss         = SpreadsheetApp.getActive();
+  let sh;
+
+  if (existing && !viaTrigger) {                       // manual run → clone
+    let n = 2;
+    while (getSheetByNameInsensitive_(base + '_' + n)) n++;
+    sh = existing.copyTo(ss).setName(base + '_' + n);
+  } else if (existing) {
+    sh = existing;
+  } else {
+    sh = ss.insertSheet(base);
+  }
+
+  /* ---- build header row ---- */
+  const headerPrompts = promSh.getRange(1, 1, 1, promSh.getLastColumn())
+                              .getValues()[0];         // row 1 of IMG_PROMPTS
+  const header = [];
+  header.push(headerPrompts[0]);                       // ASIN
+  if (addGuidelineCol) header.push('Graphical guidelines');
+  header.push(...headerPrompts.slice(1));              // all prompt titles
+  header.push('Last conversation');
+  header.push('Pack file ID');
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+
+  /* ---- copy ASIN column ---- */
+  const asins = promSh.getRange(2, 1, promSh.getLastRow() - 1, 1).getValues();
+  sh.getRange(2, 1, asins.length, 1).setValues(asins);
+
+  /* ---- make IMG_PREVIEWS rows square ---- */
+  if (base.replace(/[^a-z0-9]/gi, '').toLowerCase() === 'imgpreviews') {
+    const colWidth = sh.getColumnWidth(2);             // width of first prompt col
+    sh.setRowHeights(2, asins.length, colWidth);
+  }
+
+  return sh;
+}
+
+
+/*────────────── Misc helpers ───────────────*/
+function lookupPackshot_(asin, cleanSh, colIdx) {
+  /* data start at row 3 (skip two header rows) */
+  const rows = cleanSh.getRange(3, 1,
+                  cleanSh.getLastRow() - 2,          // height
+                  colIdx).getValues();
+
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i][0] === asin && rows[i][colIdx - 1]) {
+      return rows[i][colIdx - 1];                   // first non-empty hit
+    }
+  }
+  return '';                                         // fallback
+}
+
+function findColumnByHeader_(sh, label) {
+  const norm = s => s.toString().replace(/[^a-z0-9]/gi, '').toLowerCase();
+  const want = norm(label);
+  const rows = sh.getRange(1, 1, 2, sh.getLastColumn()).getValues();
+  for (let c = 0; c < rows[0].length; c++) {
+    if (norm(rows[0][c]) === want || norm(rows[1][c]) === want) return c + 1;
+  }
+  return -1;
+}
+
+/*──────────────────────────────────────────────────────────────
+ * scheduleSelf_
+ * – Reschedule Generate_MASTER_IMAGES 10 s later
+ * – Uses safeAlert (toast/log) for notification—no getUi()
+ *──────────────────────────────────────────────────────────────*/
+function scheduleSelf_() {
+  ScriptApp.newTrigger('Generate_MASTER_IMAGES')
+           .timeBased()
+           .after(10000)          // 10 seconds
+           .create();
+
+  safeAlert('Time limit reached – script will resume in 10 seconds.');
+}
+
+
+
+/*────────────────────────  GUIDELINE PASS  ────────────────────────
+ * • Vision reads the pack-shot (`packLink`) and answers with brand rules.
+ * • Returns { text, assistantMsg } where:
+ *      text          – plain guidelines (for the sheet’s column)
+ *      assistantMsg  – the *entire* assistant message object to keep in context
+ */
+function runGuidelineCall_(apiKey, guidelinePrompt, packLink) {
+  const payload = {
+    model : 'gpt-4o-mini',
+    input : [{
+      role    : 'user',
+      content : [
+        { type:'input_text',  text: guidelinePrompt },
+        { type:'input_image', image_url: packLink }
+      ]
+    }]
+  };
+
+  const resp = JSON.parse(UrlFetchApp.fetch(
+    'https://api.openai.com/v1/responses',
+    {
+      method : 'post',
+      headers: { Authorization:'Bearer '+apiKey,
+                 'Content-Type':'application/json' },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions:true
+    }
+  ).getContentText());
+
+  const msg = (resp.output && resp.output[0]) || null;
+  const txt = msg && (msg.text ||
+             (msg.content&&msg.content.length&&msg.content[0].text)) || '';
+  if (!txt) throw new Error('Empty guideline reply.\n'+JSON.stringify(resp));
+
+  return { text: txt.trim(), assistantMsg: msg };
+}
+
+/*───────────────────────────────  Upload pack-shot once  ────────────────────────────────
+ * • Looks for an existing file-id in linksSh row → returns it if present.
+ * • Otherwise downloads the image, uploads it to /v1/files (purpose:"vision"),
+ *   writes the file_id into the “Pack file ID” column, and returns it.           */
+function getOrCreateFileId_(apiKey, packLink, linksSh, row, PACK_FILE_COL) {
+  let fileId = linksSh.getRange(row, PACK_FILE_COL).getValue();
+  if (fileId) return fileId;                      // already cached
+
+  // 1 — download the image
+  const blob = UrlFetchApp.fetch(packLink).getBlob();
+
+  // 2 — upload to OpenAI Files
+  const uploadResp = JSON.parse(UrlFetchApp.fetch(
+    'https://api.openai.com/v1/files',
+    {
+      method : 'post',
+      headers: { Authorization : 'Bearer ' + apiKey },
+      payload: {
+        purpose : 'vision',
+        file    : blob
+      },
+      muteHttpExceptions : true
+    }
+  ).getContentText());
+
+  if (!uploadResp.id)
+    throw new Error('Pack-shot upload failed: ' + JSON.stringify(uploadResp));
+
+  // 3 — cache in sheet
+  linksSh.getRange(row, PACK_FILE_COL).setValue(uploadResp.id);
+  return uploadResp.id;
+}
+
+/*────────  VISION + TOOL  with conversation context  ────────
+ * • inputArr = previous assistantMsg + tool calls  (JSON.parse from sheet)
+ * • fileId   = pack-shot file ID  (added every turn so model sees the carton)
+ * Returns { imageB64, toolCallObj }  (toolCallObj must be appended to context)
+ */
+function runImageGenerationWithContext_(apiKey, inputArr, userPrompt, imgUrl) {
+
+  /* ---------- build user message ---------- */
+  const userContent = [{ type: 'input_text', text: userPrompt }];
+  if (imgUrl) {                                        // attach as URL
+    userContent.push({ type: 'input_image', image_url: imgUrl });
+  }
+  const userMsg = { role: 'user', content: userContent };
+
+  const payload = {
+    model : 'gpt-4.1-mini',
+    input : [...inputArr, userMsg],
+    tools : [{ type:'image_generation' }]
+  };
+
+  const resp = JSON.parse(UrlFetchApp.fetch(
+    'https://api.openai.com/v1/responses',
+    {
+      method : 'post',
+      headers: { Authorization:'Bearer '+apiKey,
+                 'Content-Type':'application/json' },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions:true
+    }
+  ).getContentText());
+  
+  const tc = (resp.output || []).find(o => o.type === 'image_generation_call');
+  if (!tc) {
+    /* ↳ model returned plain text instead of an image — keep going */
+    const assistant = (resp.output || []).find(o => o.type === 'message');
+    const txt = assistant && assistant.content && assistant.content.length
+                ? (assistant.content[0].text || '').trim()
+                : '';
+    return { imageB64: '', toolCallObj: null, assistantText: txt };   // SAFELY FALL BACK
+  }
+
+
+  /* KEEP ONLY type + id  (discard the huge base-64 “result”) */
+  const stub = { type: tc.type, id: tc.id };
+
+  return { imageB64: tc.result, toolCallObj: stub };
+
+}
+
+/* Extract the tool-call ID from an image_generation response body */
+function extractToolCallId_(rawJson) {
+  try {
+    const j = JSON.parse(rawJson);
+    const tc = (j.output || []).find(o => o.type === 'image_generation_call');
+    return tc ? tc.id : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/*──────────────────────────────────────────────────────────────
+ * Generate_COPY_FEED
+ * • Builds / refreshes COPY_FEED sheet (clone of REFINED_PROMPTS)
+ * • One GPT-4.1 call per non-blank cell (B2…last)
+ * • System prompt = SETUP["extract_copy_feed"]
+ * • User prompt   = cell content in REFINED_PROMPTS
+ * • Result is pasted VERBATIM (markdown row) into COPY_FEED
+ * • “DISMISS*” cells are copied as DISMISSED (no API call)
+ * • Logs every call in LOG_Generate COPY_FEED   (7-col header)
+ *──────────────────────────────────────────────────────────────*/
+const LOG_COPY_SHEET = 'LOG_Generate COPY_FEED';
+
+function Generate_COPY_FEED() {
+  const ss = SpreadsheetApp.getActive();
+  const t0 = Date.now();
+
+  /*──── SETUP – keys ────*/
+  const setup = getNamedSetupValues_(['OPENAI_API_KEY','extract_copy_feed']);
+  const apiKey = setup.OPENAI_API_KEY || '';
+  const sysPrompt = setup.extract_copy_feed || '';
+  if (!apiKey || !sysPrompt) { safeAlert('SETUP missing OPENAI_API_KEY or extract_copy_feed'); return; }
+
+  /*──── source / target sheets ────*/
+  const srcSh = getSheetByNameInsensitive_('REFINED_PROMPTS');
+  if (!srcSh) { safeAlert('REFINED_PROMPTS sheet not found'); return; }
+  const tgtSh = buildOrRefreshTargetSheet_('COPY_FEED', srcSh);
+
+  /*──── helper : single chat-completion ────*/
+  function runCopyAssistant_(userTxt){
+    const payload = {
+      model: 'gpt-4.1',
+      messages:[
+        {role:'system',content:sysPrompt},
+        {role:'user',  content:userTxt}
+      ]
+    };
+    for (let attempt=0;attempt<2;attempt++){
+      const resp = UrlFetchApp.fetch(
+        'https://api.openai.com/v1/chat/completions',{
+          method:'post',
+          headers:{Authorization:'Bearer '+apiKey,'Content-Type':'application/json'},
+          payload:JSON.stringify(payload),
+          muteHttpExceptions:true
+        });
+      const raw = resp.getContentText();
+      if (resp.getResponseCode()!==200) { Utilities.sleep(RETRY_DELAY); continue; }
+      try{
+        const txt = JSON.parse(raw).choices[0].message.content || '';
+        return {text:txt, raw};
+      }catch(_){}
+      Utilities.sleep(RETRY_DELAY);
+    }
+    return {text:'',raw:'FAILED'};
+  }
+
+  /*──── helper : logger ────*/
+  function logCopy_(asin, header, status, userMsg, raw){
+    const sh = ensureSheet_(LOG_COPY_SHEET);
+    if (sh.getLastRow()===0){
+      sh.appendRow(['Timestamp','ASIN','Header','Status','System msg','User msg','OpenAI raw']);
+    }
+    sh.appendRow([new Date(),asin,header,status,sysPrompt,userMsg,raw]);
+  }
+
+  /*──── main double loop ────*/
+  const lastRow = srcSh.getLastRow();
+  const lastCol = srcSh.getLastColumn();
+
+  for (let r=2;r<=lastRow;r++){
+    const asin = String(srcSh.getRange(r,1).getValue()).trim();
+    if (!asin) break;
+
+    for (let c=2;c<=lastCol;c++){
+      const colHeader = header_(srcSh,c);
+      const userMsg = String(srcSh.getRange(r,c).getValue()).trim();
+
+      if (!userMsg){
+        /* early-terminate row if the rest is blank */
+        const restBlank = srcSh.getRange(r,c,lastCol-c+1).getValues()[0]
+                          .every(v=>!String(v).trim());
+        if (restBlank) break;
+        continue;
+      }
+
+      /* DISMISS shortcut */
+      if (/^dismiss/i.test(userMsg)){
+        tgtSh.getRange(r,c).setValue('DISMISSED');
+        continue;
+      }
+
+      /* GPT-4.1 call */
+      const {text,raw} = runCopyAssistant_(userMsg);
+      const status = text ? 'OK' : 'FAIL';
+      tgtSh.getRange(r,c).setValue(text || '');       // verbatim markdown line
+      logCopy_(asin,colHeader,status,userMsg,raw);
+
+      Utilities.sleep(RATE_DELAY);
+      if (Date.now()-t0 > MAX_RUNTIME_MS){
+        ScriptApp.newTrigger('Generate_COPY_FEED').timeBased().after(10000).create();
+        safeAlert('25-minute limit – COPY_FEED will resume in 10 s.');
+        return;
+      }
+    }
+  }
+  safeAlert('Generate COPY_FEED completed.');
+}
+
+/*──────────────────────────────────────────────────────────────
+ * Create_FIGMA_FEED  – one line per SKU, wide column set
+ *──────────────────────────────────────────────────────────────*/
+function Create_FIGMA_FEED() {
+
+  /* --- locate all required sheets (case-insensitive) --- */
+  const srcSh  = getSheetByNameInsensitive_('REFINED_PROMPTS');
+  const copySh = getSheetByNameInsensitive_('COPY_FEED');
+  const mainSh = getSheetByNameInsensitive_('MASTER_IMAGES');
+  const bgSh   = getSheetByNameInsensitive_('MASTER_BACKGROUND');
+  const olSh   = getSheetByNameInsensitive_('MASTER_OVERLAY');
+
+  if (!srcSh || !copySh || !mainSh || !bgSh || !olSh) {
+    safeAlert('One of the required sheets (REFINED_PROMPTS / COPY_FEED / MASTER_* ) is missing.');
+    return;
+  }
+
+  /* --- read source data --- */
+  const promVals = srcSh.getDataRange().getValues();          // prompts
+  const copyVals = copySh.getDataRange().getValues();         // pipe text
+  const mainVals = mainSh.getDataRange().getValues();         // links
+  const bgVals   = bgSh.getDataRange().getValues();
+  const olVals   = olSh.getDataRange().getValues();
+
+  const skuRows   = promVals.length - 1;                      // exclude header
+  const tileCount = promVals[0].length - 1;                   // columns B…last
+
+  /* --- build the wide header --- */
+  const letters = ['a','b','c','d','e','f','g','h','i','j'];  // 10 text fields
+  const header  = ['ID'];
+  for (let n = 1; n <= tileCount; n++) {
+    header.push(`Frame${n}`, `ref${n}`, `main${n}`, `bg${n}`, `ol${n}`);
+    letters.forEach(l => header.push(`tx${l}${n}`));
+  }
+
+  /* --- (re)create FIGMA_FEED sheet --- */
+  const ss  = SpreadsheetApp.getActive();
+  const tgt = getSheetByNameInsensitive_('FIGMA_FEED')
+              ? getSheetByNameInsensitive_('FIGMA_FEED').clear()
+              : ss.insertSheet('FIGMA_FEED');
+  tgt.getRange(1,1,1,header.length).setValues([header]);
+
+  /* --- helper: returns 10-cell text array from pipe-string --- */
+  const splitTen = txt => {
+    const arr = txt.split('|').map(s => s.trim() || '-');
+    while (arr.length < 10) arr.push('-');
+    return arr.slice(0,10);
+  };
+
+  /* --- build all SKU rows --- */
+  const output = [];
+  for (let r = 1; r <= skuRows; r++) {                      // sheet row index (data starts at 2)
+    const asin = String(promVals[r][0]).trim();
+    if (!asin) break;
+
+    const row = [r];                                        // ID column (1-based sequential)
+    for (let t = 1; t <= tileCount; t++) {
+      const promptCell = String(promVals[r][t]).trim();
+      const isDismiss  = /^dismiss/i.test(promptCell);
+
+      /* static cells */
+      row.push('#ffffff');          // Frame<n>
+      row.push(asin);               // ref<n>
+
+      /* image links or DISMISSED */
+      const mainLink = String(mainVals[r][t]).trim();
+      const bgLink   = String(bgVals[r][t]).trim();
+      const olLink   = String(olVals[r][t]).trim();
+      row.push(isDismiss ? 'DISMISSED' : mainLink);
+      row.push(isDismiss ? 'DISMISSED' : bgLink);
+      row.push(isDismiss ? 'DISMISSED' : olLink);
+
+      /* ten text cells */
+      const copyCell = String(copyVals[r][t]).trim();
+      const txArr    = isDismiss ? new Array(10).fill('DISMISSED')
+                                 : splitTen(copyCell);
+      row.push(...txArr);
+    }
+    output.push(row);
+  }
+
+  /* --- write to sheet --- */
+  if (output.length) tgt.getRange(2,1,output.length,header.length).setValues(output);
+
+  safeAlert('Create FIGMA_FEED completed. Rows added: ' + output.length);
+}
+
+function convertDriveLinks() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const range = sheet.getDataRange();
+  const values = range.getValues();
+
+  const ucRegex = /https:\/\/drive\.google\.com\/uc\?export=view&id=([a-zA-Z0-9_-]+)/g;
+
+  for (let i = 0; i < values.length; i++) {
+    for (let j = 0; j < values[i].length; j++) {
+      let cell = values[i][j];
+      if (typeof cell === 'string' && cell.includes('drive.google.com/uc?export=view&id=')) {
+        values[i][j] = cell.replace(ucRegex, 'https://drive.google.com/thumbnail?id=$1&sz=w1000');
+      }
+    }
+  }
+
+  range.setValues(values);
+  SpreadsheetApp.getUi().alert('✅ Drive links converted to thumbnail format.');
+}
+
